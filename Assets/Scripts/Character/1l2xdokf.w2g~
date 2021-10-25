@@ -1,0 +1,224 @@
+using System.Collections;
+using System.Collections.Generic;
+using UnityEngine;
+using UnityEngine.EventSystems;
+using UnityEngine.SceneManagement;
+using MLAPI;
+using MLAPI.Messaging;
+using MLAPI.NetworkVariable;
+using System.IO;
+
+public class Player : NetworkBehaviour, IBeginDragHandler, IDragHandler, IEndDragHandler
+{
+    public SampleTest test;
+
+    public SpriteRenderer arrowSprite;
+    public Rigidbody physicBody;
+    public SpriteRenderer cooldownSprite;
+    public GameObject cooldownSpriteParent;
+    public AnimatorController model;
+
+
+    private Vector3 _startPos;
+    private Vector3 _power;
+
+    private float? _startCoolDown = null;
+
+    public NetworkVariableFloat coolDown = new NetworkVariableFloat(new NetworkVariableSettings()
+    {
+        WritePermission = NetworkVariablePermission.ServerOnly,
+        ReadPermission = NetworkVariablePermission.Everyone
+    });
+
+    public NetworkVariableVector3 position = new NetworkVariableVector3(new NetworkVariableSettings
+    {
+        WritePermission = NetworkVariablePermission.ServerOnly,
+        ReadPermission = NetworkVariablePermission.Everyone
+    });
+
+    public NetworkVariableBool isMovable = new NetworkVariableBool(new NetworkVariableSettings
+    {
+        WritePermission = NetworkVariablePermission.ServerOnly,
+        ReadPermission = NetworkVariablePermission.Everyone
+    });
+
+
+    private void Awake()
+    {
+        arrowSprite.gameObject.SetActive(false);
+        cooldownSpriteParent.SetActive(false);
+
+        if (IsServer)
+        {
+            transform.Translate(Vector3.right * 1045);
+            StartCoroutine(WaitUntilVelocityZero());
+        }
+
+        coolDown.OnValueChanged += OnChangeCoolDown;
+    }
+
+    private void OnDestroy()
+    {
+        coolDown.OnValueChanged -= OnChangeCoolDown;
+    }
+
+    private void OnChangeCoolDown(float prev, float cur)
+    {
+        if(_startCoolDown == null || cur > prev)
+        {
+            _startCoolDown = cur;
+        }
+
+        if(cur > 0)
+        {
+            if (IsHost == true || IsServer == false)
+            {
+                cooldownSpriteParent.SetActive(true);
+                cooldownSprite.transform.localScale = new Vector3(coolDown.Value / _startCoolDown.Value, 1, 1);
+            }
+
+            if(IsServer)
+            {
+                isMovable.Value = false;
+            }
+        }
+        else
+        {
+            if (IsHost == true || IsServer == false)
+            {
+                cooldownSpriteParent.SetActive(false);
+            }
+
+            if(IsServer)
+            {
+                isMovable.Value = true;
+            }
+        }
+    }
+
+
+    public override void NetworkStart()
+    {
+        base.NetworkStart();
+
+        if (IsOwner)
+        {
+            FollowCam.Instance.SetTarget(transform);
+            gameObject.layer = LayerMask.NameToLayer("Player");
+        }
+        else
+        {
+            gameObject.layer = LayerMask.NameToLayer("NPlayer");
+        }
+
+        if (IsServer == false)
+        {
+            Destroy(physicBody); 
+        }
+    }
+
+    public void OnBeginDrag(PointerEventData eventData)
+    {
+        arrowSprite.gameObject.SetActive(true);
+        Cursor.visible = false;
+        _startPos = eventData.position;
+    }
+
+    public void OnDrag(PointerEventData eventData)
+    {
+        var delta = (Vector3)eventData.position - _startPos;
+        delta = Vector3.ClampMagnitude(delta * 0.1f, 100);
+        var angle = Vector2.SignedAngle(Vector3.right, delta);
+        _power = new Vector3(-delta.x, 0, -delta.y);
+
+        FollowCam.Instance.ZoomOut(delta.magnitude * 0.01f);
+
+        arrowSprite.transform.localRotation = Quaternion.Euler(-90, -angle, 0);
+        arrowSprite.transform.localScale = new Vector3(-_power.magnitude * 0.01f, 0.5f, 1);
+    }
+
+    public void OnEndDrag(PointerEventData eventData)
+    {
+        Cursor.visible = true;
+        Cursor.lockState = CursorLockMode.Locked;
+        Cursor.lockState = CursorLockMode.None;
+        arrowSprite.gameObject.SetActive(false);
+        FollowCam.Instance.ZoomIn();
+        RequestMove();
+    }
+
+
+    public void RequestMove()
+    {
+        if(isMovable.Value == false)
+        {
+            return;
+        }
+
+        if (NetworkManager.Singleton.IsServer)
+        {
+            _power *= SampleTest.power.Value * 0.001f;
+            Move();
+        }
+        else
+        {
+            MoveServerRpc(_power);
+        }
+    }
+
+    [ServerRpc]
+    private void MoveServerRpc(Vector3 pow)
+    {
+        _power = pow * SampleTest.power.Value * 0.001f;
+        Move();
+    }
+
+    private void Move()
+    {
+        arrowSprite.gameObject.SetActive(false);
+        physicBody.AddForce(_power, ForceMode.Impulse);
+        StartCoroutine(WaitUntilVelocityZero());
+    }
+
+    IEnumerator WaitUntilVelocityZero()
+    {
+        isMovable.Value = false;
+        model.SetBool(AnimatorController.eAnimatorKey.IsRushing, true);
+        yield return new WaitUntil(() => physicBody.velocity != Vector3.zero);
+        yield return new WaitUntil(() => physicBody.velocity == Vector3.zero);
+        model.SetBool(AnimatorController.eAnimatorKey.IsRushing, false);
+        coolDown.Value = Random.Range(0f, 1f);
+    }
+
+    private void FixedUpdate()
+    {
+        if(physicBody != null)
+            model.transform.LookAt(new Vector3(model.transform.position.x + physicBody.velocity.x, model.transform.position.y, model.transform.position.z + physicBody.velocity.z));
+    }
+
+
+
+
+    private void Update()
+    {
+        if (IsServer)
+        {
+            if (transform.position.y < -20)
+            {
+                transform.position = new Vector3(1050, 20, 0);
+                physicBody.velocity = Vector3.zero;
+            }
+
+            position.Value = transform.position;
+
+            if (coolDown.Value > 0)
+            {
+                coolDown.Value -= Time.deltaTime;
+            }
+        }
+        else
+        {
+            transform.position = position.Value;
+        }
+    }
+}
